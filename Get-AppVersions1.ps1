@@ -33,7 +33,12 @@
     it and the package Id matches the Publisher. WinGet and WinGetRepo use WinGetId when
     SourceId is blank. The mapped list is written to MappedImport_<timestamp>.csv so matches
     can be reviewed and corrected; rows that already have a WinGetId are not searched again.
-    Use -NoIdLookup to turn this off.
+
+    When Evergreen is in use, the same rows are also matched against the Evergreen catalog
+    (Find-EvergreenApp) by Name, e.g. GoogleChrome, or Application, e.g. Google Chrome Enterprise.
+    The match is stored in an EvergreenName column, which Evergreen uses in place of AppName.
+    Rows that already have an EvergreenName are not matched again.
+    Use -NoIdLookup to turn off both lookups.
 
     -SearchMode FirstMatch (default) returns the first source that answers.
     -SearchMode Highest queries every applicable source and reports the highest version.
@@ -59,6 +64,7 @@
       Type             (optional) Evergreen/Nevergreen type filter, e.g. msi, exe, msix
       Channel          (optional) Evergreen/Nevergreen channel filter, e.g. stable
       WinGetId         (optional) WinGet identifier found by the automatic lookup
+      EvergreenName    (optional) Evergreen app name found by the automatic lookup
 
 .PARAMETER FromSccm
     Read applications targeted by deployments in ConfigMgr. Requires the console on this machine.
@@ -86,7 +92,7 @@
     in the Error column. When -Sources is omitted, the automatic selection described above applies.
 
 .PARAMETER NoIdLookup
-    Do not search WinGet by name for rows with a blank SourceId.
+    Do not look up WinGet ids or Evergreen names for rows with a blank SourceId.
 
 .EXAMPLE
     .\Get-ThirdPartyUpdateReport.ps1 -CsvPath .\apps-sample.csv
@@ -193,12 +199,33 @@ function Select-LatestCandidate {
 
     $architecture = if ($Row.Architecture) { $Row.Architecture } else { $Arch }
 
-    $Candidates |
-        Where-Object { -not $_.Architecture -or $_.Architecture -eq $architecture } |
-        Where-Object { -not $Row.Channel -or -not $_.Channel -or $_.Channel -eq $Row.Channel } |
-        Where-Object { -not $Row.Type -or -not $_.Type -or $_.Type -eq $Row.Type } |
-        Sort-Object -Property @{ Expression = { ConvertTo-ComparableVersion $_.Version }; Descending = $true } |
+    # Without a Channel on the row, pre-release builds are left out, e.g. Chrome Canary or VS Code Insider
+    $preRelease = '^(?i)(beta|dev|canary|insiders?|preview|nightly|alpha|rc|test|unstable)$'
+    $filtered = @($Candidates |
+        Where-Object { $_.Version } |
+        Where-Object { if ($Row.Channel) { -not $_.Channel -or $_.Channel -eq $Row.Channel } else { $_.Channel -notmatch $preRelease } } |
+        Where-Object { -not $Row.Type -or -not $_.Type -or $_.Type -eq $Row.Type })
+
+    # Prefer the requested architecture, then architecture-neutral builds, then x86 (as for
+    # apps such as WinSCP that only publish x86). A row with Architecture set gets that only.
+    $ranked = foreach ($candidate in $filtered) {
+        $rank = if (-not $candidate.Architecture -or $candidate.Architecture -match '^(?i)(neutral|any|all)$') { 1 }
+                elseif ($candidate.Architecture -eq $architecture) { 0 }
+                elseif (-not $Row.Architecture -and $candidate.Architecture -eq 'x86') { 2 }
+                else { continue }
+        [pscustomobject]@{ Rank = $rank; Candidate = $candidate }
+    }
+
+    $best = $ranked |
+        Sort-Object -Property Rank, @{ Expression = { ConvertTo-ComparableVersion $_.Candidate.Version }; Descending = $true } |
         Select-Object -First 1
+
+    if (-not $best -and @($Candidates).Count) {
+        throw "$(@($Candidates).Count) result(s), none for architecture $architecture" +
+            $(if ($Row.Channel) { ", channel $($Row.Channel)" } else { ' in a stable channel' }) +
+            $(if ($Row.Type) { ", type $($Row.Type)" } else { '' })
+    }
+    if ($best) { $best.Candidate }
 }
 
 #endregion
@@ -299,7 +326,12 @@ function Get-LatestFromEvergreen {
         throw 'Evergreen module not installed. Run: Install-Module Evergreen'
     }
 
-    $name = if ($Row.SourceId) { $Row.SourceId } else { $Row.AppName }
+    # SourceId is an Evergreen name when Source is Evergreen; otherwise it may be another
+    # source's id, so the name found by the automatic lookup comes first
+    $name = if ($Row.Source -eq 'Evergreen' -and $Row.SourceId) { $Row.SourceId }
+            elseif ($Row.EvergreenName) { $Row.EvergreenName }
+            elseif ($Row.SourceId) { $Row.SourceId }
+            else { $Row.AppName }
     $candidates = @(Get-EvergreenApp -Name $name -ErrorAction Stop)
 
     $best = Select-LatestCandidate -Candidates $candidates -Row $Row -Arch $Arch
@@ -639,6 +671,56 @@ function Find-WinGetId {
     [pscustomobject]@{ Id = $best.Id; Detail = "winget search '$query': $detail" }
 }
 
+function Find-EvergreenName {
+    # Matches a row against the Evergreen catalog from Find-EvergreenApp, comparing the cleaned
+    # AppName with each entry's Name (e.g. GoogleChrome) and Application (e.g. Google Chrome Enterprise).
+    # Returns $null when nothing is confident enough.
+    param($Row, $Catalog)
+
+    $query = Get-SearchName $Row.AppName
+    $queryKey = ConvertTo-MatchKey $query
+    if ($queryKey.Length -lt 3) { return $null }
+
+    $publisherKey = Get-PublisherKey $Row.Publisher
+    # "VLC Media Player" from VideoLAN also matches "VideoLAN VLC Media Player"
+    $withPublisher = if ($publisherKey -and -not $queryKey.StartsWith($publisherKey)) { $publisherKey + $queryKey } else { '' }
+    $nameNumbers = @([regex]::Matches($Row.AppName, '\d+') | ForEach-Object { $_.Value.TrimStart('0') })
+
+    $scored = foreach ($entry in $Catalog) {
+        $nameKey = ConvertTo-MatchKey $entry.Name
+        $appKey = ConvertTo-MatchKey $entry.Application
+
+        $match = if ($queryKey -in $nameKey, $appKey -or ($withPublisher -and $withPublisher -in $nameKey, $appKey)) { 'exact' }
+                 elseif ($appKey.StartsWith($queryKey) -or $nameKey.StartsWith($queryKey) -or
+                         ($withPublisher -and ($appKey.StartsWith($withPublisher) -or $nameKey.StartsWith($withPublisher)))) { 'prefix' }
+                 else { '' }
+        if (-not $match) { continue }
+
+        $publisherMatch = $publisherKey.Length -ge 3 -and ($appKey.StartsWith($publisherKey) -or $nameKey.StartsWith($publisherKey))
+
+        # Numbers in the Evergreen name that the AppName lacks point to another edition, e.g. 1Password7
+        $conflict = @([regex]::Matches($entry.Name, '\d+') | Where-Object { $_.Value.TrimStart('0') -notin $nameNumbers }).Count -gt 0
+
+        $score = 0
+        if ($match -eq 'exact')  { $score += 6 }
+        if ($match -eq 'prefix') { $score += 2 }
+        if ($publisherMatch)     { $score += 3 }
+        if ($conflict)           { $score -= 6 }
+
+        [pscustomobject]@{ Name = $entry.Name; Application = $entry.Application; Score = $score; Match = $match; PublisherMatch = $publisherMatch }
+    }
+
+    $best = $scored |
+        Where-Object { $_.Score -ge 5 } |
+        Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = { $_.Application.Length } } |
+        Select-Object -First 1
+    if (-not $best) { return $null }
+
+    $detail = "$($best.Match) name '$($best.Application)'"
+    if ($best.PublisherMatch) { $detail += ', publisher match' }
+    [pscustomobject]@{ Name = $best.Name; Detail = "Find-EvergreenApp '$query': $detail" }
+}
+
 #endregion
 
 #region Source resolution
@@ -821,9 +903,9 @@ $usedSources = @($usedSources | Select-Object -Unique)
 Write-Log "Checking prerequisites for: $($usedSources -join ', ')"
 Initialize-Prerequisites -UsedSources $usedSources -IdLookup (-not $NoIdLookup)
 
-# Every row gets WinGetId and IdMatch so the mapped CSV has consistent columns
+# Every row gets the lookup columns so the mapped CSV has consistent columns
 foreach ($row in $rows) {
-    foreach ($column in 'WinGetId', 'IdMatch') {
+    foreach ($column in 'WinGetId', 'IdMatch', 'EvergreenName', 'EvergreenMatch') {
         if (-not $row.PSObject.Properties[$column]) {
             $row | Add-Member -NotePropertyName $column -NotePropertyValue ''
         }
@@ -863,10 +945,47 @@ if (-not $NoIdLookup) {
             }
         }
 
-        $mappedPath = Join-Path $OutputDirectory "MappedImport_$stamp.csv"
-        $rows | Export-Csv -Path $mappedPath -NoTypeInformation
-        Write-Log "Matched $found of $($lookupRows.Count). Mapped list written to $mappedPath"
+        Write-Log "Matched $found of $($lookupRows.Count) to a WinGet id"
     }
+
+    # Evergreen names, matched against the catalog Find-EvergreenApp returns in one call
+    if ('Evergreen' -in $usedSources -and (Get-Command Find-EvergreenApp -ErrorAction SilentlyContinue)) {
+        $lookupRows = @($rows | Where-Object {
+            $_.AppName -and -not $_.EvergreenName -and
+            (-not $_.Source -or ($_.Source -eq 'Evergreen' -and -not $_.SourceId)) -and
+            -not (Get-SkipReason $_)
+        })
+        Write-Log "Looking up Evergreen names for $($lookupRows.Count) application(s)"
+
+        try {
+            $catalog = @(Find-EvergreenApp -WarningAction SilentlyContinue -InformationAction SilentlyContinue -ErrorAction Stop)
+        }
+        catch {
+            Write-Log "Find-EvergreenApp failed, skipping Evergreen name lookup: $($_.Exception.Message)" 'WARN'
+            $catalog = @()
+        }
+
+        $found = 0
+        if ($catalog.Count) {
+            foreach ($row in $lookupRows) {
+                $match = Find-EvergreenName -Row $row -Catalog $catalog
+                if ($match) {
+                    $row.EvergreenName = $match.Name
+                    $row.EvergreenMatch = $match.Detail
+                    $found++
+                    Write-Log "  $($row.AppName) -> $($match.Name)"
+                }
+                else {
+                    $row.EvergreenMatch = 'No confident Evergreen match'
+                }
+            }
+            Write-Log "Matched $found of $($lookupRows.Count) to an Evergreen name"
+        }
+    }
+
+    $mappedPath = Join-Path $OutputDirectory "MappedImport_$stamp.csv"
+    $rows | Export-Csv -Path $mappedPath -NoTypeInformation
+    Write-Log "Mapped list written to $mappedPath"
 }
 
 Write-Log "Checking $($rows.Count) application(s) using $SearchMode mode"
@@ -887,6 +1006,8 @@ $results = foreach ($row in $rows) {
             SourceId         = $row.SourceId
             WinGetId         = ''
             IdMatch          = ''
+            EvergreenName    = ''
+            EvergreenMatch   = ''
             DownloadUrl      = $null
             Error            = $skipReason
             CheckedUtc       = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -915,6 +1036,8 @@ $results = foreach ($row in $rows) {
         SourceId         = $row.SourceId
         WinGetId         = $row.WinGetId
         IdMatch          = $row.IdMatch
+        EvergreenName    = $row.EvergreenName
+        EvergreenMatch   = $row.EvergreenMatch
         DownloadUrl      = $latest.DownloadUrl
         Error            = $latest.Error
         CheckedUtc       = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -941,7 +1064,7 @@ $preContent = @(
 )
 
 $updateTable = $updates | Select-Object Application, Publisher, InstalledVersion, LatestVersion, Source, WinGetId, DownloadUrl
-$reviewTable = $review  | Select-Object Application, Publisher, InstalledVersion, Status, WinGetId, IdMatch, Error
+$reviewTable = $review  | Select-Object Application, Publisher, InstalledVersion, Status, WinGetId, EvergreenName, Error
 
 $htmlBody = @()
 $htmlBody += $updateTable | ConvertTo-Html -Fragment
