@@ -39,6 +39,13 @@
 .PARAMETER Force
     Download again even when the application folder already contains files.
 
+.PARAMETER SkipHashCheck
+    Keep a manifest download whose SHA256 does not match InstallerSha256 instead of deleting it.
+    The mismatch is still reported in the log and the Error column, and HashChecked is False.
+    Also passes --ignore-security-hash to the winget download fallback, which only works when
+    an administrator has run "winget settings --enable InstallerHashOverride" and the script
+    is not running elevated. Use this only for vendors that replace files at a fixed URL.
+
 .EXAMPLE
     .\Save-AppInstallers.ps1
 
@@ -57,7 +64,8 @@ param(
     [string]$Architecture = 'x64',
     [ValidateSet('machine', 'user')]
     [string]$Scope = 'machine',
-    [switch]$Force
+    [switch]$Force,
+    [switch]$SkipHashCheck
 )
 
 $ProgressPreference = 'SilentlyContinue'   # The progress bar slows Invoke-WebRequest downloads considerably
@@ -243,8 +251,11 @@ function Get-InstallerFileName {
 
 function Save-FromUrl {
     # Downloads a file and checks it. Throws when the server returns a web page instead of a
-    # file or when the SHA256 does not match the manifest.
+    # file or when the SHA256 does not match the manifest. With -SkipHashCheck a mismatched file
+    # is kept and the mismatch is recorded in $script:HashWarning.
     param([string]$Url, [string]$Destination, [string]$Sha256)
+
+    $script:HashWarning = ''
 
     $response = Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing -UserAgent $script:UserAgent -PassThru
 
@@ -256,8 +267,14 @@ function Save-FromUrl {
     if ($Sha256) {
         $actual = (Get-FileHash -Path $Destination -Algorithm SHA256).Hash
         if ($actual -ne $Sha256) {
+            $message = "SHA256 mismatch for $Url (expected $Sha256, got $actual)"
+            if ($SkipHashCheck) {
+                $script:HashWarning = "$message, kept because of -SkipHashCheck"
+                Write-Log "  $script:HashWarning" 'WARN'
+                return $false
+            }
             Remove-Item -Path $Destination -Force
-            throw "SHA256 mismatch for $Url (expected $Sha256, got $actual)"
+            throw $message
         }
         return $true
     }
@@ -277,6 +294,7 @@ function Save-WithWinGet {
     if ($Source -eq 'winget') {
         $arguments += @('--architecture', $Architecture, '--scope', $Scope)
         if ($Version) { $arguments += @('--version', $Version) }
+        if ($SkipHashCheck) { $arguments += '--ignore-security-hash' }
     }
     else {
         $arguments += '--skip-license'
@@ -378,6 +396,7 @@ $results = foreach ($row in $rows) {
             $result.HashChecked = Save-FromUrl -Url $installer.Url -Destination $destination -Sha256 $installer.Sha256
             $result.Method = 'WinGetManifest'
             $result.File = $destination
+            if ($script:HashWarning) { $errors += $script:HashWarning }
         }
         catch {
             $errors += "Manifest: $($_.Exception.Message)"
