@@ -460,7 +460,14 @@ function Get-LatestFromChocolatey {
         Select-Object -First 1
     if (-not $package -or -not $package.Version) { return $null }
 
-    [pscustomobject]@{ Version = $package.Version; DownloadUrl = "choco:$($package.Id)" }
+    [pscustomobject]@{ Version = (Remove-PackageFixDate $package.Version); DownloadUrl = "choco:$($package.Id)" }
+}
+
+function Remove-PackageFixDate {
+    # Chocolatey republishes a package by adding a date as the fourth part, e.g. LAPS 6.2.0 becomes
+    # 6.2.0.20260126. The date is not part of the application version, so it is removed.
+    param([string]$Version)
+    return ($Version -replace '^(\d+\.\d+\.\d+)\.(19|20)\d{6}$', '$1')
 }
 
 function Find-ChocolateyId {
@@ -497,8 +504,10 @@ function Find-ChocolateyId {
         $titleKey = ConvertTo-MatchKey $candidate.Title
         $idKey = ConvertTo-MatchKey $candidate.Id
 
+        # Prefix matches use the title only. Ids are often short and generic, so "Office" would
+        # otherwise match office-online-chrome.
         $match = if ($queryKey -in $titleKey, $idKey) { 'exact' }
-                 elseif ($titleKey.StartsWith($queryKey) -or $idKey.StartsWith($queryKey)) { 'prefix' }
+                 elseif ($titleKey.StartsWith($queryKey)) { 'prefix' }
                  else { '' }
         if (-not $match) { continue }
 
@@ -510,6 +519,10 @@ function Find-ChocolateyId {
         $conflict = @([regex]::Matches($candidate.Id, '\d+') | Where-Object { $_.Value.TrimStart('0') -notin $nameNumbers }).Count -gt 0
         if ($candidate.Id -match '(?i)[.-](beta|dev|nightly|preview|insiders?|canary|alpha|portable|commandline)$' -and
             $Row.AppName -notmatch "(?i)\b$($Matches[1])\b") { $conflict = $true }
+        # A version that starts with a year is a release date (made2010 is 2024.4.13) or another
+        # yearly edition (DWG TrueView 2027 for 2025), unless the AppName has that year
+        $versionMajor = ((Remove-PackageFixDate $candidate.Version) -split '\.')[0]
+        if ($versionMajor -match '^(19|20)\d\d$' -and $versionMajor -notin $nameNumbers) { $conflict = $true }
 
         $score = 0
         if ($match -eq 'exact')  { $score += 6 }
