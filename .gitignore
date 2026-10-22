@@ -2,3 +2,6 @@
 *.html
 *.log
 *.csv
+
+# Installers downloaded by Save-AppInstallers.ps1
+Downloads/
