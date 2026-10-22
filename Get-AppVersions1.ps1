@@ -14,7 +14,8 @@
       MSStore     Windows Package Manager msstore source. SourceId = Store product ID.
       WinGetRepo  Community repository on GitHub (microsoft/winget-pkgs), read via the GitHub API.
                   SourceId = package identifier, e.g. Google.Chrome
-      Chocolatey  Chocolatey community repository. SourceId = package id, e.g. googlechrome
+      Chocolatey  Chocolatey community feed, queried directly (choco is not needed).
+                  SourceId = package id, e.g. googlechrome
       GitHub      Latest non-prerelease GitHub release. SourceId = owner/repo, e.g. microsoft/terminal
       Scoop       Scoop buckets (main, extras, versions). SourceId = app or bucket/app,
                   e.g. git or extras/notepad2
@@ -38,7 +39,11 @@
     (Find-EvergreenApp) by Name, e.g. GoogleChrome, or Application, e.g. Google Chrome Enterprise.
     The match is stored in an EvergreenName column, which Evergreen uses in place of AppName.
     Rows that already have an EvergreenName are not matched again.
-    Use -NoIdLookup to turn off both lookups.
+
+    When Chocolatey is requested (in -Sources or a row's Source), rows that neither lookup
+    matched are searched on the Chocolatey community feed and the match is stored in a
+    ChocolateyId column. Requests are spaced 500 ms apart to respect the feed's rate limits.
+    Use -NoIdLookup to turn off all three lookups.
 
     -SearchMode FirstMatch (default) returns the first source that answers.
     -SearchMode Highest queries every applicable source and reports the highest version.
@@ -65,6 +70,7 @@
       Channel          (optional) Evergreen/Nevergreen channel filter, e.g. stable
       WinGetId         (optional) WinGet identifier found by the automatic lookup
       EvergreenName    (optional) Evergreen app name found by the automatic lookup
+      ChocolateyId     (optional) Chocolatey package id found by the automatic lookup
 
 .PARAMETER FromSccm
     Read applications targeted by deployments in ConfigMgr. Requires the console on this machine.
@@ -92,7 +98,7 @@
     in the Error column. When -Sources is omitted, the automatic selection described above applies.
 
 .PARAMETER NoIdLookup
-    Do not look up WinGet ids or Evergreen names for rows with a blank SourceId.
+    Do not look up WinGet ids, Evergreen names or Chocolatey ids for rows with a blank SourceId.
 
 .EXAMPLE
     .\Get-ThirdPartyUpdateReport.ps1 -CsvPath .\apps-sample.csv
@@ -111,7 +117,7 @@
     Before checking, the script prepares what the sources in use need: it installs the Evergreen
     and Nevergreen modules from PSGallery when missing (CurrentUser scope, or AllUsers when
     elevated), imports them, and runs Update-Evergreen to refresh Evergreen's app definitions.
-    It warns when winget (App Installer), choco or GITHUB_TOKEN are missing but needed.
+    It warns when winget (App Installer) or GITHUB_TOKEN are missing but needed.
     GitHub-based sources (GitHub, WinGetRepo, Scoop) are rate-limited to about 60 unauthenticated
     requests per hour. Set the GITHUB_TOKEN environment variable to raise the limit.
 #>
@@ -140,6 +146,9 @@ $script:ScoopBuckets = @{
 
 # winget search results by search name, shared by rows that clean up to the same name
 $script:WinGetSearchCache = @{}
+
+# Time of the last Chocolatey feed request, used to space requests out
+$script:ChocolateyLastCall = [datetime]::MinValue
 
 #region Helpers
 
@@ -306,10 +315,6 @@ function Initialize-Prerequisites {
         Write-Log 'winget not found. WinGet/MSStore lookups and the automatic ID lookup need App Installer from the Microsoft Store.' 'WARN'
     }
 
-    if ('Chocolatey' -in $UsedSources -and -not (Get-Command choco -ErrorAction SilentlyContinue)) {
-        Write-Log 'choco not found. Chocolatey lookups need Chocolatey from https://chocolatey.org/install' 'WARN'
-    }
-
     if (@($UsedSources | Where-Object { $_ -in 'GitHub', 'WinGetRepo', 'Scoop' }).Count -and -not $env:GITHUB_TOKEN) {
         Write-Log 'GITHUB_TOKEN is not set. GitHub, WinGetRepo and Scoop share a limit of about 60 GitHub API requests per hour.' 'WARN'
     }
@@ -421,23 +426,109 @@ function Get-LatestFromWinGetRepo {
     }
 }
 
+function Invoke-ChocolateyFeed {
+    # Queries the Chocolatey community feed (OData v2) directly, so choco does not need to be
+    # installed. Returns Id, Title, Version and Authors for each latest stable package.
+    # The feed limits request rates, so calls are spaced out.
+    param([string]$Query)
+
+    $elapsed = ((Get-Date) - $script:ChocolateyLastCall).TotalMilliseconds
+    if ($elapsed -lt 500) { Start-Sleep -Milliseconds (500 - $elapsed) }
+    $script:ChocolateyLastCall = Get-Date
+
+    $content = (Invoke-WebRequest -Uri "https://community.chocolatey.org/api/v2/$Query" -UseBasicParsing -TimeoutSec 60).Content
+    $feed = [xml]$content
+
+    foreach ($entry in @($feed.feed.entry)) {
+        if (-not $entry) { continue }
+        [pscustomobject]@{
+            Id      = [string]$entry.title.'#text'
+            Title   = [string]$entry.properties.Title
+            Version = [string]$entry.properties.Version
+            Authors = [string]$entry.author.name
+        }
+    }
+}
+
 function Get-LatestFromChocolatey {
     param([string]$Id)
 
-    if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
-        throw 'choco not found. Install Chocolatey from https://chocolatey.org/install'
-    }
     if (-not $Id) { throw 'Chocolatey lookup needs SourceId (package id, e.g. googlechrome).' }
 
-    # --limit-output returns lines in the form name|version
-    $lines = & choco search $Id --exact --limit-output 2>$null
-    foreach ($line in $lines) {
-        $parts = $line -split '\|'
-        if ($parts.Count -ge 2 -and $parts[0] -ieq $Id) {
-            return [pscustomobject]@{ Version = $parts[1]; DownloadUrl = "choco:$Id" }
+    $escaped = [uri]::EscapeDataString($Id.Replace("'", "''"))
+    $package = Invoke-ChocolateyFeed -Query "Packages()?`$filter=Id%20eq%20'$escaped'%20and%20IsLatestVersion&`$top=1" |
+        Select-Object -First 1
+    if (-not $package -or -not $package.Version) { return $null }
+
+    [pscustomobject]@{ Version = $package.Version; DownloadUrl = "choco:$($package.Id)" }
+}
+
+function Find-ChocolateyId {
+    # Searches the Chocolatey feed by name and picks the best package for a row, scored like
+    # Find-WinGetId. Returns $null when nothing is confident enough.
+    param($Row)
+
+    $query = Get-SearchName $Row.AppName
+    $queryKey = ConvertTo-MatchKey $query
+    if ($queryKey.Length -lt 3) { return $null }
+
+    $search = {
+        param($Text)
+        $escaped = [uri]::EscapeDataString($Text.Replace("'", "''"))
+        @(Invoke-ChocolateyFeed -Query "Search()?searchTerm='$escaped'&targetFramework=''&includePrerelease=false&`$filter=IsLatestVersion&`$top=20")
+    }
+
+    $candidates = @(& $search $query)
+    if ($candidates.Count -eq 0) {
+        # Second try without a trailing number, e.g. "Citrix Workspace LTSR 2402" becomes "Citrix Workspace LTSR"
+        $shorter = ($query -replace '\s+\d+$', '').Trim()
+        if ($shorter -ne $query -and $shorter.Length -ge 3) {
+            $query = $shorter
+            $queryKey = ConvertTo-MatchKey $query
+            $candidates = @(& $search $query)
         }
     }
-    return $null
+    if ($candidates.Count -eq 0) { return $null }
+
+    $publisherKey = Get-PublisherKey $Row.Publisher
+    $nameNumbers = @([regex]::Matches($Row.AppName, '\d+') | ForEach-Object { $_.Value.TrimStart('0') })
+
+    $scored = foreach ($candidate in $candidates) {
+        $titleKey = ConvertTo-MatchKey $candidate.Title
+        $idKey = ConvertTo-MatchKey $candidate.Id
+
+        $match = if ($queryKey -in $titleKey, $idKey) { 'exact' }
+                 elseif ($titleKey.StartsWith($queryKey) -or $idKey.StartsWith($queryKey)) { 'prefix' }
+                 else { '' }
+        if (-not $match) { continue }
+
+        $publisherMatch = $publisherKey.Length -ge 3 -and (
+            (ConvertTo-MatchKey $candidate.Authors).Contains($publisherKey) -or $titleKey.StartsWith($publisherKey))
+
+        # Numbers or suffixes in the package id that the AppName lacks point to another edition,
+        # e.g. python2, firefox-nightly, or a .portable / .install variant of the same package
+        $conflict = @([regex]::Matches($candidate.Id, '\d+') | Where-Object { $_.Value.TrimStart('0') -notin $nameNumbers }).Count -gt 0
+        if ($candidate.Id -match '(?i)[.-](beta|dev|nightly|preview|insiders?|canary|alpha|portable|commandline)$' -and
+            $Row.AppName -notmatch "(?i)\b$($Matches[1])\b") { $conflict = $true }
+
+        $score = 0
+        if ($match -eq 'exact')  { $score += 6 }
+        if ($match -eq 'prefix') { $score += 2 }
+        if ($publisherMatch)     { $score += 3 }
+        if ($conflict)           { $score -= 6 }
+
+        [pscustomobject]@{ Id = $candidate.Id; Title = $candidate.Title; Score = $score; Match = $match; PublisherMatch = $publisherMatch }
+    }
+
+    $best = $scored |
+        Where-Object { $_.Score -ge 5 } |
+        Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = { $_.Id.Length } } |
+        Select-Object -First 1
+    if (-not $best) { return $null }
+
+    $detail = "$($best.Match) name '$($best.Title)'"
+    if ($best.PublisherMatch) { $detail += ', publisher match' }
+    [pscustomobject]@{ Id = $best.Id; Detail = "Chocolatey search '$query': $detail" }
 }
 
 #endregion
@@ -746,7 +837,7 @@ function Invoke-SourceLookup {
         'WinGet'     { Get-LatestFromWinGet -Id $winGetId -Source 'winget' }
         'MSStore'    { Get-LatestFromWinGet -Id $Row.SourceId -Source 'msstore' }
         'WinGetRepo' { Get-LatestFromWinGetRepo -Id $winGetId }
-        'Chocolatey' { Get-LatestFromChocolatey -Id $Row.SourceId }
+        'Chocolatey' { Get-LatestFromChocolatey -Id $(if ($Row.SourceId) { $Row.SourceId } else { $Row.ChocolateyId }) }
         'GitHub'     { Get-LatestFromGitHub -Id $Row.SourceId }
         'Scoop'      { Get-LatestFromScoop -Id $Row.SourceId }
         default      { throw "Unknown source '$Source'. Use Evergreen, Nevergreen, WinGet, MSStore, WinGetRepo, Chocolatey, GitHub or Scoop." }
@@ -766,8 +857,10 @@ function Resolve-LatestVersion {
     elseif ($Row.SourceId) {
         @('Evergreen', 'Nevergreen') + @(Get-IdBasedSources -Id $Row.SourceId)
     }
-    elseif ($Row.WinGetId) {
-        @('Evergreen', 'Nevergreen', 'WinGet', 'WinGetRepo')
+    elseif ($Row.WinGetId -or $Row.ChocolateyId) {
+        @('Evergreen', 'Nevergreen') +
+            $(if ($Row.WinGetId) { @('WinGet', 'WinGetRepo') } else { @() }) +
+            $(if ($Row.ChocolateyId) { @('Chocolatey') } else { @() })
     }
     else {
         @('Evergreen', 'Nevergreen')
@@ -898,6 +991,7 @@ foreach ($row in $rows) {
     $usedSources += 'Evergreen', 'Nevergreen'
     if ($row.SourceId) { $usedSources += Get-IdBasedSources -Id $row.SourceId }
     elseif ($row.WinGetId -or -not $NoIdLookup) { $usedSources += 'WinGet', 'WinGetRepo' }
+    if ($row.ChocolateyId) { $usedSources += 'Chocolatey' }
 }
 $usedSources = @($usedSources | Select-Object -Unique)
 Write-Log "Checking prerequisites for: $($usedSources -join ', ')"
@@ -905,7 +999,7 @@ Initialize-Prerequisites -UsedSources $usedSources -IdLookup (-not $NoIdLookup)
 
 # Every row gets the lookup columns so the mapped CSV has consistent columns
 foreach ($row in $rows) {
-    foreach ($column in 'WinGetId', 'IdMatch', 'EvergreenName', 'EvergreenMatch') {
+    foreach ($column in 'WinGetId', 'IdMatch', 'EvergreenName', 'EvergreenMatch', 'ChocolateyId', 'ChocolateyMatch') {
         if (-not $row.PSObject.Properties[$column]) {
             $row | Add-Member -NotePropertyName $column -NotePropertyValue ''
         }
@@ -983,6 +1077,47 @@ if (-not $NoIdLookup) {
         }
     }
 
+    # Chocolatey ids, only when Chocolatey is requested and only for rows the other lookups
+    # could not match, to keep requests to the community feed down
+    $chocolateyRequested = 'Chocolatey' -in $Sources -or @($rows | Where-Object { $_.Source -eq 'Chocolatey' }).Count
+    if ($chocolateyRequested) {
+        $lookupRows = @($rows | Where-Object {
+            $_.AppName -and -not $_.SourceId -and -not $_.ChocolateyId -and
+            -not $_.WinGetId -and -not $_.EvergreenName -and
+            (-not $_.Source -or $_.Source -eq 'Chocolatey') -and
+            -not (Get-SkipReason $_)
+        })
+        Write-Log "Looking up Chocolatey ids for $($lookupRows.Count) application(s)"
+
+        # Rows that clean up to the same name and publisher share one search
+        $cache = @{}
+        $found = 0
+        foreach ($row in $lookupRows) {
+            $key = (Get-SearchName $row.AppName) + '|' + (Get-PublisherKey $row.Publisher)
+            if (-not $cache.ContainsKey($key)) {
+                try {
+                    $cache[$key] = Find-ChocolateyId -Row $row
+                }
+                catch {
+                    Write-Log "Chocolatey lookup failed for $($row.AppName): $($_.Exception.Message)" 'WARN'
+                    $cache[$key] = $null
+                }
+            }
+
+            $match = $cache[$key]
+            if ($match) {
+                $row.ChocolateyId = $match.Id
+                $row.ChocolateyMatch = $match.Detail
+                $found++
+                Write-Log "  $($row.AppName) -> $($match.Id)"
+            }
+            else {
+                $row.ChocolateyMatch = 'No confident Chocolatey match'
+            }
+        }
+        Write-Log "Matched $found of $($lookupRows.Count) to a Chocolatey id"
+    }
+
     $mappedPath = Join-Path $OutputDirectory "MappedImport_$stamp.csv"
     $rows | Export-Csv -Path $mappedPath -NoTypeInformation
     Write-Log "Mapped list written to $mappedPath"
@@ -1008,6 +1143,8 @@ $results = foreach ($row in $rows) {
             IdMatch          = ''
             EvergreenName    = ''
             EvergreenMatch   = ''
+            ChocolateyId     = ''
+            ChocolateyMatch  = ''
             DownloadUrl      = $null
             Error            = $skipReason
             CheckedUtc       = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -1038,6 +1175,8 @@ $results = foreach ($row in $rows) {
         IdMatch          = $row.IdMatch
         EvergreenName    = $row.EvergreenName
         EvergreenMatch   = $row.EvergreenMatch
+        ChocolateyId     = $row.ChocolateyId
+        ChocolateyMatch  = $row.ChocolateyMatch
         DownloadUrl      = $latest.DownloadUrl
         Error            = $latest.Error
         CheckedUtc       = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
