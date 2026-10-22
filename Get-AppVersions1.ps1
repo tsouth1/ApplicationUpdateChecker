@@ -24,6 +24,17 @@
     identifier goes to WinGet and WinGetRepo, and a plain name goes to Chocolatey. Scoop and
     MSStore are never tried automatically; set Source explicitly for those.
 
+    Rows with a blank Publisher, or a Publisher matching *lear*, are skipped (status Skipped)
+    unless the row already has Source or SourceId filled in.
+
+    For other rows with a blank SourceId, the script searches the WinGet source by name
+    (winget search --name) and stores the best match in a WinGetId column. A match is kept
+    when the cleaned-up AppName equals the package name, or when the package name starts with
+    it and the package Id matches the Publisher. WinGet and WinGetRepo use WinGetId when
+    SourceId is blank. The mapped list is written to MappedImport_<timestamp>.csv so matches
+    can be reviewed and corrected; rows that already have a WinGetId are not searched again.
+    Use -NoIdLookup to turn this off.
+
     -SearchMode FirstMatch (default) returns the first source that answers.
     -SearchMode Highest queries every applicable source and reports the highest version.
     The Candidates column shows what each source returned.
@@ -32,6 +43,7 @@
       UpdateStatus_<timestamp>.csv    every application and its status
       UpdatesRequired_<timestamp>.csv applications that need an update only
       UpdateReport_<timestamp>.html   summary with the update list and items needing review
+      MappedImport_<timestamp>.csv    input rows with WinGetId and IdMatch (when lookup ran)
 
     With -FromSccm the script only reads from ConfigMgr. It writes an import CSV you can edit
     (fill in Source and SourceId for apps that did not map) and re-run with -CsvPath.
@@ -46,6 +58,7 @@
       Architecture     (optional) x64 | x86 | arm64. Defaults to -DefaultArchitecture
       Type             (optional) Evergreen/Nevergreen type filter, e.g. msi, exe, msix
       Channel          (optional) Evergreen/Nevergreen channel filter, e.g. stable
+      WinGetId         (optional) WinGet identifier found by the automatic lookup
 
 .PARAMETER FromSccm
     Read applications targeted by deployments in ConfigMgr. Requires the console on this machine.
@@ -71,6 +84,9 @@
     Each source needs its identifier: SourceId for WinGet, WinGetRepo, Chocolatey, GitHub and Scoop,
     or AppName/SourceId for Evergreen and Nevergreen. Rows missing that identifier are recorded
     in the Error column. When -Sources is omitted, the automatic selection described above applies.
+
+.PARAMETER NoIdLookup
+    Do not search WinGet by name for rows with a blank SourceId.
 
 .EXAMPLE
     .\Get-ThirdPartyUpdateReport.ps1 -CsvPath .\apps-sample.csv
@@ -102,7 +118,8 @@ param(
     [ValidateSet('FirstMatch', 'Highest')]
     [string]$SearchMode = 'FirstMatch',
     [ValidateSet('Evergreen', 'Nevergreen', 'WinGet', 'MSStore', 'WinGetRepo', 'Chocolatey', 'GitHub', 'Scoop')]
-    [string[]]$Sources
+    [string[]]$Sources,
+    [switch]$NoIdLookup
 )
 
 # Scoop buckets used by the Scoop source. Branch is master for all three.
@@ -111,6 +128,9 @@ $script:ScoopBuckets = @{
     'extras'   = 'ScoopInstaller/Extras'
     'versions' = 'ScoopInstaller/Versions'
 }
+
+# winget search results by search name, shared by rows that clean up to the same name
+$script:WinGetSearchCache = @{}
 
 #region Helpers
 
@@ -369,6 +389,163 @@ function Get-LatestFromScoop {
 
 #endregion
 
+#region Automatic WinGet ID lookup
+
+function Get-SkipReason {
+    # Rows that are mapped by hand are never skipped
+    param($Row)
+
+    if ($Row.Source -or $Row.SourceId) { return $null }
+    if ([string]::IsNullOrWhiteSpace($Row.Publisher)) { return 'Skipped: no publisher' }
+    if ($Row.Publisher -like '*lear*') { return "Skipped: publisher '$($Row.Publisher)'" }
+    return $null
+}
+
+function ConvertTo-MatchKey {
+    # Lowercase letters and digits only, so "Notepad++ (64-bit)" and "notepad 64bit" compare cleanly
+    param([string]$Text)
+    if (-not $Text) { return '' }
+    return ($Text.ToLower() -replace '[^a-z0-9]', '')
+}
+
+function Get-SearchName {
+    # Strips installer wording, versions and architecture from a ConfigMgr display name,
+    # e.g. "TortoiseSVN 1.14.9.29743 (64 bit)" becomes "TortoiseSVN"
+    param([string]$AppName)
+
+    $name = $AppName -replace '(?i)^\s*(install|uninstall)\s+', ''
+    $name = $name -replace '(?i)\bversion\s+\S+', ''
+    $name = $name -replace '\bv?\d+(\.\d+)+\S*', ''
+    $name = $name -replace '(?i)\(?\b(x64|x86|amd64|arm64|64[- ]?bit|32[- ]?bit)\b\)?', ''
+    $name = $name -replace '\(\s*\)', ''
+    $name = $name -replace '\s+-\s+.*$', ''
+    return ($name -replace '\s+', ' ').Trim(' -_')
+}
+
+function Get-PublisherKey {
+    # First significant word of the publisher, e.g. "Microsoft Corporation" becomes "microsoft"
+    param([string]$Publisher)
+
+    $words = @($Publisher -split '[\s,\.]+' | Where-Object {
+        $_ -and $_ -notmatch '^(?i)(inc|corp|corporation|llc|ltd|limited|gmbh|ag|co|company|the|s\.?a)$'
+    })
+    if ($words.Count -eq 0) { return '' }
+    return (ConvertTo-MatchKey $words[0])
+}
+
+function Search-WinGetByName {
+    # Returns Name/Id pairs from "winget search --name". The output is a fixed-width table,
+    # so columns are cut at the positions of the header words above the dashed line.
+    param([string]$Name)
+
+    if ($script:WinGetSearchCache.ContainsKey($Name)) { return $script:WinGetSearchCache[$Name] }
+    $script:WinGetSearchCache[$Name] = @(Invoke-WinGetSearch -Name $Name)
+    return $script:WinGetSearchCache[$Name]
+}
+
+function Invoke-WinGetSearch {
+    param([string]$Name)
+
+    $output = @(& winget search --name $Name --source winget --accept-source-agreements --disable-interactivity 2>&1 |
+        ForEach-Object { [string]$_ })
+    if ($LASTEXITCODE -ne 0) { return @() }
+
+    $dashIndex = -1
+    for ($i = 1; $i -lt $output.Count; $i++) {
+        if ($output[$i] -match '^-{10,}\s*$') { $dashIndex = $i; break }
+    }
+    if ($dashIndex -lt 1) { return @() }
+
+    $columns = [regex]::Matches($output[$dashIndex - 1], '\S+')
+    if ($columns.Count -lt 3) { return @() }
+    $idStart = $columns[1].Index
+    $versionStart = $columns[2].Index
+
+    foreach ($line in $output[($dashIndex + 1)..($output.Count - 1)]) {
+        if ($line.Length -le $versionStart) { continue }
+        $id = $line.Substring($idStart, $versionStart - $idStart).Trim()
+        # Skip truncated ids and rows misaligned by wide characters in the name
+        if ($id -notmatch '^[^\s.]+(\.[^\s.]+)+$' -or $id.Contains([char]0x2026)) { continue }
+        [pscustomobject]@{ Name = $line.Substring(0, $idStart).Trim(); Id = $id }
+    }
+}
+
+function Find-WinGetId {
+    # Picks the best WinGet package for a row. Returns $null when nothing is confident enough.
+    param($Row)
+
+    $query = Get-SearchName $Row.AppName
+    if ($query.Length -lt 3) { return $null }
+
+    $candidates = @(Search-WinGetByName -Name $query)
+    if ($candidates.Count -eq 0) {
+        # Second try without a trailing number, e.g. "FormingSuite 2018" becomes "FormingSuite"
+        $shorter = ($query -replace '\s+\d+$', '').Trim()
+        if ($shorter -ne $query -and $shorter.Length -ge 3) {
+            $query = $shorter
+            $candidates = @(Search-WinGetByName -Name $query)
+        }
+    }
+    if ($candidates.Count -eq 0) { return $null }
+
+    $queryKey = ConvertTo-MatchKey $query
+    $publisherKey = Get-PublisherKey $Row.Publisher
+
+    # Numbers in the original name (".NET 8.0.24" gives 8, 0, 24) and its architecture, used to
+    # reject ids pinned to another major version or architecture, e.g. DesktopRuntime.9 or VCRedist.2013.x86
+    $nameNumbers = @([regex]::Matches($Row.AppName, '\d+') | ForEach-Object { $_.Value.TrimStart('0') })
+    $nameArch = if ($Row.AppName -match '(?i)\b(x86|32[- ]?bit)\b') { 'x86' }
+                elseif ($Row.AppName -match '(?i)\b(x64|amd64|64[- ]?bit)\b') { 'x64' }
+                elseif ($Row.AppName -match '(?i)\barm64\b') { 'arm64' }
+                else { '' }
+
+    $scored = foreach ($candidate in $candidates) {
+        $nameKey = ConvertTo-MatchKey $candidate.Name
+        $idSegments = @($candidate.Id -split '\.')
+        $idPublisherKey = ConvertTo-MatchKey $idSegments[0]
+
+        $conflict = $false
+        foreach ($segment in $idSegments[1..($idSegments.Count - 1)]) {
+            if ($segment -match '^\d+$' -and $segment.TrimStart('0') -notin $nameNumbers) { $conflict = $true }
+            # Years inside a segment, e.g. AccessDatabaseEngine2016
+            foreach ($year in [regex]::Matches($segment, '(19|20)\d\d')) {
+                if ($year.Value -notin $nameNumbers) { $conflict = $true }
+            }
+            if ($segment -match '^(?i)(x86|x64|arm64)$' -and $nameArch -and $segment -ne $nameArch) { $conflict = $true }
+            if ($segment -match '^(?i)(beta|preview|nightly|weekly|dev|canary|insiders?|alpha|rc)$' -and
+                $Row.AppName -notmatch "(?i)\b$segment\b") { $conflict = $true }
+        }
+
+        $nameMatch = if ($nameKey -eq $queryKey) { 'exact' } elseif ($nameKey.StartsWith($queryKey)) { 'prefix' } else { '' }
+        $publisherMatch = $publisherKey.Length -ge 3 -and $idPublisherKey -and
+            ($idPublisherKey.Contains($publisherKey) -or $publisherKey.Contains($idPublisherKey))
+
+        # Exact name wins; a prefix name only counts when the publisher also matches
+        $score = 0
+        if ($nameMatch -eq 'exact')  { $score += 6 }
+        if ($nameMatch -eq 'prefix') { $score += 2 }
+        if ($publisherMatch)         { $score += 3 }
+        if ($conflict)               { $score -= 6 }
+
+        [pscustomobject]@{
+            Id = $candidate.Id; Name = $candidate.Name; Score = $score
+            NameMatch = $nameMatch; PublisherMatch = $publisherMatch
+        }
+    }
+
+    $best = $scored |
+        Where-Object { $_.Score -ge 5 } |
+        Sort-Object -Property @{ Expression = 'Score'; Descending = $true }, @{ Expression = { $_.Name.Length } } |
+        Select-Object -First 1
+    if (-not $best) { return $null }
+
+    $detail = "$($best.NameMatch) name '$($best.Name)'"
+    if ($best.PublisherMatch) { $detail += ', publisher match' }
+    [pscustomobject]@{ Id = $best.Id; Detail = "winget search '$query': $detail" }
+}
+
+#endregion
+
 #region Source resolution
 
 function Get-IdBasedSources {
@@ -383,12 +560,15 @@ function Get-IdBasedSources {
 function Invoke-SourceLookup {
     param([string]$Source, $Row, [string]$Arch)
 
+    # The automatic lookup fills WinGetId, used when SourceId is blank
+    $winGetId = if ($Row.SourceId) { $Row.SourceId } else { $Row.WinGetId }
+
     switch ($Source) {
         'Evergreen'  { Get-LatestFromEvergreen -Row $Row -Arch $Arch }
         'Nevergreen' { Get-LatestFromNevergreen -Row $Row -Arch $Arch }
-        'WinGet'     { Get-LatestFromWinGet -Id $Row.SourceId -Source 'winget' }
+        'WinGet'     { Get-LatestFromWinGet -Id $winGetId -Source 'winget' }
         'MSStore'    { Get-LatestFromWinGet -Id $Row.SourceId -Source 'msstore' }
-        'WinGetRepo' { Get-LatestFromWinGetRepo -Id $Row.SourceId }
+        'WinGetRepo' { Get-LatestFromWinGetRepo -Id $winGetId }
         'Chocolatey' { Get-LatestFromChocolatey -Id $Row.SourceId }
         'GitHub'     { Get-LatestFromGitHub -Id $Row.SourceId }
         'Scoop'      { Get-LatestFromScoop -Id $Row.SourceId }
@@ -408,6 +588,9 @@ function Resolve-LatestVersion {
     }
     elseif ($Row.SourceId) {
         @('Evergreen', 'Nevergreen') + @(Get-IdBasedSources -Id $Row.SourceId)
+    }
+    elseif ($Row.WinGetId) {
+        @('Evergreen', 'Nevergreen', 'WinGet', 'WinGetRepo')
     }
     else {
         @('Evergreen', 'Nevergreen')
@@ -527,10 +710,78 @@ else {
     $rows = @(Import-Csv -Path $CsvPath)
 }
 
+# Every row gets WinGetId and IdMatch so the mapped CSV has consistent columns
+foreach ($row in $rows) {
+    foreach ($column in 'WinGetId', 'IdMatch') {
+        if (-not $row.PSObject.Properties[$column]) {
+            $row | Add-Member -NotePropertyName $column -NotePropertyValue ''
+        }
+    }
+}
+
+if (-not $NoIdLookup) {
+    if (-not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Log 'winget not found, skipping automatic ID lookup' 'WARN'
+    }
+    else {
+        $lookupRows = @($rows | Where-Object {
+            $_.AppName -and -not $_.SourceId -and -not $_.WinGetId -and
+            (-not $_.Source -or $_.Source -in @('WinGet', 'WinGetRepo')) -and
+            -not (Get-SkipReason $_)
+        })
+        Write-Log "Looking up WinGet IDs for $($lookupRows.Count) application(s)"
+
+        $found = 0
+        foreach ($row in $lookupRows) {
+            $match = $null
+            try {
+                $match = Find-WinGetId -Row $row
+            }
+            catch {
+                Write-Log "ID lookup failed for $($row.AppName): $($_.Exception.Message)" 'WARN'
+            }
+
+            if ($match) {
+                $row.WinGetId = $match.Id
+                $row.IdMatch = $match.Detail
+                $found++
+                Write-Log "  $($row.AppName) -> $($match.Id)"
+            }
+            else {
+                $row.IdMatch = 'No confident WinGet match'
+            }
+        }
+
+        $mappedPath = Join-Path $OutputDirectory "MappedImport_$stamp.csv"
+        $rows | Export-Csv -Path $mappedPath -NoTypeInformation
+        Write-Log "Matched $found of $($lookupRows.Count). Mapped list written to $mappedPath"
+    }
+}
+
 Write-Log "Checking $($rows.Count) application(s) using $SearchMode mode"
 
 $results = foreach ($row in $rows) {
     if (-not $row.AppName) { continue }
+
+    $skipReason = Get-SkipReason $row
+    if ($skipReason) {
+        [pscustomobject]@{
+            Application      = $row.AppName
+            Publisher        = $row.Publisher
+            InstalledVersion = $row.InstalledVersion
+            LatestVersion    = $null
+            Status           = 'Skipped'
+            Source           = $null
+            Candidates       = ''
+            SourceId         = $row.SourceId
+            WinGetId         = ''
+            IdMatch          = ''
+            DownloadUrl      = $null
+            Error            = $skipReason
+            CheckedUtc       = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
+        }
+        continue
+    }
 
     Write-Log "Checking $($row.AppName)"
     $latest = Resolve-LatestVersion -Row $row -Arch $DefaultArchitecture -Mode $SearchMode -CommandLineSources $Sources
@@ -551,6 +802,8 @@ $results = foreach ($row in $rows) {
         Source           = $latest.Source
         Candidates       = $latest.Candidates
         SourceId         = $row.SourceId
+        WinGetId         = $row.WinGetId
+        IdMatch          = $row.IdMatch
         DownloadUrl      = $latest.DownloadUrl
         Error            = $latest.Error
         CheckedUtc       = (Get-Date).ToUniversalTime().ToString('yyyy-MM-ddTHH:mm:ssZ')
@@ -576,8 +829,8 @@ $preContent = @(
     '<h3>Updates available</h3>'
 )
 
-$updateTable = $updates | Select-Object Application, Publisher, InstalledVersion, LatestVersion, Source, DownloadUrl
-$reviewTable = $review  | Select-Object Application, Publisher, InstalledVersion, Status, Error
+$updateTable = $updates | Select-Object Application, Publisher, InstalledVersion, LatestVersion, Source, WinGetId, DownloadUrl
+$reviewTable = $review  | Select-Object Application, Publisher, InstalledVersion, Status, WinGetId, IdMatch, Error
 
 $htmlBody = @()
 $htmlBody += $updateTable | ConvertTo-Html -Fragment
@@ -587,7 +840,8 @@ $htmlBody += $reviewTable | ConvertTo-Html -Fragment
 ConvertTo-Html -Title 'Third-party application update report' -PreContent $preContent -Body $htmlBody |
     Set-Content -Path $htmlPath -Encoding UTF8
 
-Write-Log "Done. $($updates.Count) update(s) required, $($review.Count) item(s) need review."
+$skipped = @($results | Where-Object { $_.Status -eq 'Skipped' })
+Write-Log "Done. $($updates.Count) update(s) required, $($review.Count) item(s) need review, $($skipped.Count) skipped."
 Write-Log "Full status:      $fullCsv"
 Write-Log "Updates required: $updatesCsv"
 Write-Log "HTML report:      $htmlPath"
