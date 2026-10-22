@@ -1,0 +1,4 @@
+# Generated reports, logs and data exports
+*.html
+*.log
+*.csv
