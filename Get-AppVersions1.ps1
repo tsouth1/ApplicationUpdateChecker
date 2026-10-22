@@ -368,12 +368,17 @@ function Get-LatestFromWinGetRepo {
 
     $listing = Invoke-RestMethod -Uri "https://api.github.com/repos/microsoft/winget-pkgs/contents/$path" -Headers (Get-GitHubHeaders)
 
+    # The folder can also hold related packages, e.g. DesktopRuntime/8/x86 or
+    # SQLServerManagementStudio/22. Version folders start with a digit, and when any
+    # dotted version exists, dotless names like 22 are treated as package folders.
     $versions = @()
     foreach ($item in $listing) {
-        if ($item.type -ne 'dir') { continue }
+        if ($item.type -ne 'dir' -or $item.name -notmatch '^v?\d') { continue }
         $parsed = ConvertTo-ComparableVersion $item.name
         if ($parsed) { $versions += [pscustomobject]@{ Name = $item.name; Parsed = $parsed } }
     }
+    $dotted = @($versions | Where-Object { $_.Name -match '\.' })
+    if ($dotted.Count) { $versions = $dotted }
 
     $latest = $versions | Sort-Object -Property Parsed -Descending | Select-Object -First 1
     if (-not $latest) { return $null }

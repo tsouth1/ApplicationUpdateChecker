@@ -42,9 +42,8 @@
 .PARAMETER SkipHashCheck
     Keep a manifest download whose SHA256 does not match InstallerSha256 instead of deleting it.
     The mismatch is still reported in the log and the Error column, and HashChecked is False.
-    Also passes --ignore-security-hash to the winget download fallback, which only works when
-    an administrator has run "winget settings --enable InstallerHashOverride" and the script
-    is not running elevated. Use this only for vendors that replace files at a fixed URL.
+    It does not apply to the winget download fallback, which always checks the hash.
+    Use this only for vendors that replace files at a fixed URL.
 
 .EXAMPLE
     .\Save-AppInstallers.ps1
@@ -257,9 +256,20 @@ function Save-FromUrl {
 
     $script:HashWarning = ''
 
-    $response = Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing -UserAgent $script:UserAgent -PassThru
+    # No -PassThru: in Windows PowerShell 5.1 it also loads the whole file into memory, which
+    # fails for installers over about 1 GB. A web page is detected from the file's first bytes.
+    Invoke-WebRequest -Uri $Url -OutFile $Destination -UseBasicParsing -UserAgent $script:UserAgent
 
-    if ($response.Headers['Content-Type'] -match 'text/html') {
+    $stream = [IO.File]::OpenRead($Destination)
+    try {
+        $buffer = New-Object byte[] 512
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+    }
+    finally {
+        $stream.Dispose()
+    }
+    $head = [Text.Encoding]::ASCII.GetString($buffer, 0, $read).TrimStart()
+    if ($head -match '^(?i)(<!doctype html|<html)') {
         Remove-Item -Path $Destination -Force
         throw "Server returned a web page instead of a file: $Url"
     }
@@ -294,7 +304,6 @@ function Save-WithWinGet {
     if ($Source -eq 'winget') {
         $arguments += @('--architecture', $Architecture, '--scope', $Scope)
         if ($Version) { $arguments += @('--version', $Version) }
-        if ($SkipHashCheck) { $arguments += '--ignore-security-hash' }
     }
     else {
         $arguments += '--skip-license'
