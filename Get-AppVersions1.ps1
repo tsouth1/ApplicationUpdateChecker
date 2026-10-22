@@ -102,7 +102,10 @@
 
 .NOTES
     Requires PowerShell 5.1 or later.
-    Optional: Evergreen and Nevergreen modules, winget (App Installer), choco.
+    Before checking, the script prepares what the sources in use need: it installs the Evergreen
+    and Nevergreen modules from PSGallery when missing (CurrentUser scope, or AllUsers when
+    elevated), imports them, and runs Update-Evergreen to refresh Evergreen's app definitions.
+    It warns when winget (App Installer), choco or GITHUB_TOKEN are missing but needed.
     GitHub-based sources (GitHub, WinGetRepo, Scoop) are rate-limited to about 60 unauthenticated
     requests per hour. Set the GITHUB_TOKEN environment variable to raise the limit.
 #>
@@ -196,6 +199,93 @@ function Select-LatestCandidate {
         Where-Object { -not $Row.Type -or -not $_.Type -or $_.Type -eq $Row.Type } |
         Sort-Object -Property @{ Expression = { ConvertTo-ComparableVersion $_.Version }; Descending = $true } |
         Select-Object -First 1
+}
+
+#endregion
+
+#region Prerequisites
+
+function Install-RequiredModule {
+    # Installs a PSGallery module when missing, then imports it. Returns $true when it is loaded.
+    param([string]$Name)
+
+    if (-not (Get-Module -ListAvailable -Name $Name)) {
+        Write-Log "$Name module not found, installing from PSGallery"
+        try {
+            # Windows PowerShell 5.1 defaults to TLS 1.0, which PSGallery rejects
+            [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
+            $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+                [Security.Principal.WindowsBuiltInRole]::Administrator)
+            $scope = if ($isAdmin) { 'AllUsers' } else { 'CurrentUser' }
+
+            # Install-Module needs the NuGet provider; installing it here avoids an interactive prompt
+            $nuget = Get-PackageProvider -ListAvailable -Name NuGet -ErrorAction SilentlyContinue |
+                Where-Object { $_.Version -ge [version]'2.8.5.201' }
+            if (-not $nuget) {
+                Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Scope $scope -Force -ErrorAction Stop | Out-Null
+            }
+
+            # -Force installs from PSGallery without changing its trust setting
+            Install-Module -Name $Name -Repository PSGallery -Scope $scope -Force -AllowClobber -ErrorAction Stop
+            Write-Log "Installed $Name for $scope"
+        }
+        catch {
+            Write-Log "Could not install $Name module: $($_.Exception.Message)" 'WARN'
+            return $false
+        }
+    }
+
+    try {
+        Import-Module -Name $Name -ErrorAction Stop
+        $version = (Get-Module -Name $Name).Version
+        Write-Log "$Name module $version loaded"
+        return $true
+    }
+    catch {
+        Write-Log "Could not import $Name module: $($_.Exception.Message)" 'WARN'
+        return $false
+    }
+}
+
+function Initialize-Prerequisites {
+    # Prepares the modules and tools used by the sources this run will query. A missing
+    # prerequisite is reported here and again in the Error column of each affected row.
+    param([string[]]$UsedSources, [bool]$IdLookup)
+
+    if ('Evergreen' -in $UsedSources -and (Install-RequiredModule -Name 'Evergreen')) {
+        # Evergreen keeps app definitions in a local cache (%LocalAppData%\Evergreen) that
+        # Update-Evergreen downloads and refreshes. Without it Get-EvergreenApp knows no apps.
+        try {
+            Write-Log 'Updating Evergreen app definitions (Update-Evergreen)'
+            Update-Evergreen -ErrorAction Stop
+        }
+        catch {
+            $cache = Get-EvergreenAppsPath -ErrorAction SilentlyContinue
+            if ($cache -and (Test-Path $cache)) {
+                Write-Log "Update-Evergreen failed, using existing cache at ${cache}: $($_.Exception.Message)" 'WARN'
+            }
+            else {
+                Write-Log "Update-Evergreen failed and no local cache exists. Evergreen lookups will fail: $($_.Exception.Message)" 'WARN'
+            }
+        }
+    }
+
+    # Nevergreen has its app definitions built in and needs no update step
+    if ('Nevergreen' -in $UsedSources) { [void](Install-RequiredModule -Name 'Nevergreen') }
+
+    if (($IdLookup -or @($UsedSources | Where-Object { $_ -in 'WinGet', 'MSStore' }).Count) -and
+        -not (Get-Command winget -ErrorAction SilentlyContinue)) {
+        Write-Log 'winget not found. WinGet/MSStore lookups and the automatic ID lookup need App Installer from the Microsoft Store.' 'WARN'
+    }
+
+    if ('Chocolatey' -in $UsedSources -and -not (Get-Command choco -ErrorAction SilentlyContinue)) {
+        Write-Log 'choco not found. Chocolatey lookups need Chocolatey from https://chocolatey.org/install' 'WARN'
+    }
+
+    if (@($UsedSources | Where-Object { $_ -in 'GitHub', 'WinGetRepo', 'Scoop' }).Count -and -not $env:GITHUB_TOKEN) {
+        Write-Log 'GITHUB_TOKEN is not set. GitHub, WinGetRepo and Scoop share a limit of about 60 GitHub API requests per hour.' 'WARN'
+    }
 }
 
 #endregion
@@ -709,6 +799,22 @@ else {
     Write-Log "Reading application list from $CsvPath"
     $rows = @(Import-Csv -Path $CsvPath)
 }
+
+# Work out which sources this run can reach, so only their prerequisites are prepared.
+# Rows with a Source value use it; other rows use -Sources, or the automatic choice, which
+# starts with Evergreen and Nevergreen and adds sources based on SourceId or WinGetId.
+$usedSources = @()
+foreach ($row in $rows) {
+    if (-not $row.AppName -or (Get-SkipReason $row)) { continue }
+    if ($row.Source) { $usedSources += $row.Source; continue }
+    if ($Sources) { $usedSources += $Sources; continue }
+    $usedSources += 'Evergreen', 'Nevergreen'
+    if ($row.SourceId) { $usedSources += Get-IdBasedSources -Id $row.SourceId }
+    elseif ($row.WinGetId -or -not $NoIdLookup) { $usedSources += 'WinGet', 'WinGetRepo' }
+}
+$usedSources = @($usedSources | Select-Object -Unique)
+Write-Log "Checking prerequisites for: $($usedSources -join ', ')"
+Initialize-Prerequisites -UsedSources $usedSources -IdLookup (-not $NoIdLookup)
 
 # Every row gets WinGetId and IdMatch so the mapped CSV has consistent columns
 foreach ($row in $rows) {
